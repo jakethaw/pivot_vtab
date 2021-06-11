@@ -141,7 +141,7 @@
 **   -- Pivot query
 **   --
 **   -- This query should define a single value in the pivot table when
-**   -- filtered by the pivot table row key (1?) and a column key (2?)
+**   -- filtered by the pivot table row key (?1) and a column key (?2)
 **   --
 **  (SELECT val
 **     FROM x 
@@ -277,6 +277,7 @@ static int pivotConnect(
   pivot_vtab *tab;
   char *sql;
   sqlite3_stmt *stmt;
+  int rc;
   
   tab = (pivot_vtab*)sqlite3_malloc(sizeof(pivot_vtab));
   if( tab==0 ) return SQLITE_NOMEM;
@@ -288,7 +289,16 @@ static int pivotConnect(
   // key row definition query - get key column name
   //
   tab->key_sql = remove_parentheses(argv[3]);
-  sqlite3_prepare_v2(db, tab->key_sql, -1, &stmt, 0);
+  rc = sqlite3_prepare_v2(db, tab->key_sql, -1, &stmt, 0);
+
+  // Validate pivot table key query
+  if( rc!=SQLITE_OK ){
+    *pzErr = sqlite3_mprintf("Pivot table key query error - %s", sqlite3_errmsg(db));
+    sqlite3_free(tab->key_sql);
+    sqlite3_free(tab);
+    return SQLITE_ERROR;
+  }
+  
   char *key_column_name = sqlite3_mprintf("%s", sqlite3_column_name(stmt, 0));
   sqlite3_finalize(stmt);
   
@@ -297,6 +307,16 @@ static int pivotConnect(
   //
   char *pivot_query_sql = remove_parentheses(argv[5]);
   //printf("%s\n", tab->pivot_query_sql);
+  rc = sqlite3_prepare_v2(db, pivot_query_sql, -1, &stmt, 0);
+
+  // Validate pivot query 
+  if( rc!=SQLITE_OK ){
+    *pzErr = sqlite3_mprintf("Pivot query error - %s", sqlite3_errmsg(db));
+    sqlite3_free(pivot_query_sql);
+    sqlite3_free(tab);
+    return SQLITE_ERROR;
+  }
+  sqlite3_finalize(stmt);
   
   //
   // declare vtab
@@ -308,7 +328,15 @@ static int pivotConnect(
   
   // Pivot table column definition query
   sql = remove_parentheses(argv[4]);
-  sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+  rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+
+  // Validate pivot table column definition query
+  if( rc!=SQLITE_OK ){
+    *pzErr = sqlite3_mprintf("Pivot table column definition query error - %s", sqlite3_errmsg(db));
+    sqlite3_free(sql);
+    sqlite3_free(tab);
+    return SQLITE_ERROR;
+  }
   sqlite3_free(sql);
   
   tab->nCol_key = 0;
@@ -334,7 +362,7 @@ static int pivotConnect(
   
   sql = sqlite3_str_finish(create_vtab_sql);
   //printf("%s\n", sql);
-  int rc = sqlite3_declare_vtab(db, sql);
+  rc = sqlite3_declare_vtab(db, sql);
   sqlite3_free(sql);
   
   return rc;
