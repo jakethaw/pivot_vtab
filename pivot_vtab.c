@@ -254,6 +254,17 @@ char *remove_parentheses(const char *zIn){
   return sql;
 }
 
+#define PIVOT_VTAB_CONNECT_ERROR \
+  sqlite3_finalize(stmt); \
+  sqlite3_free(sql); \
+  sqlite3_free(pivot_query_sql); \
+  sqlite3_free(key_column_name); \
+  sqlite3_free(tab->key_sql); \
+  sqlite3_free(tab); \
+  sqlite3_free(zMsg); \
+  sqlite3_free_table(azData); \
+  return SQLITE_ERROR;
+
 /*
 ** The pivotConnect() method is invoked to create a new
 ** template virtual table.
@@ -275,7 +286,9 @@ static int pivotConnect(
   char **pzErr
 ){
   pivot_vtab *tab;
-  char *sql;
+  char *sql = 0;
+  char *pivot_query_sql = 0;
+  char *key_column_name = 0;
   sqlite3_stmt *stmt;
   int rc;
   
@@ -285,60 +298,108 @@ static int pivotConnect(
   tab->db = db;
   *ppVtab = (sqlite3_vtab*)tab;
 
-  // 
-  // key row definition query - get key column name
-  //
+  // vars for sqlite3_get_table
+  int nRow = 0;
+  int nCol = 0;
+  char **azData = 0;
+  char *zMsg = 0;
+
+  ///////////////////////////////////////////////////
+  // Pivot table key query
+  ///////////////////////////////////////////////////
+
   tab->key_sql = remove_parentheses(argv[3]);
   rc = sqlite3_prepare_v2(db, tab->key_sql, -1, &stmt, 0);
 
   // Validate pivot table key query
   if( rc!=SQLITE_OK ){
-    *pzErr = sqlite3_mprintf("Pivot table key query error - %s", sqlite3_errmsg(db));
-    sqlite3_free(tab->key_sql);
-    sqlite3_free(tab);
-    return SQLITE_ERROR;
+    *pzErr = sqlite3_mprintf("Pivot table key query prepare error - %s", sqlite3_errmsg(db));
+    PIVOT_VTAB_CONNECT_ERROR
+  }
+
+  // Validate pivot table key query column count == 1
+  //
+  // TODO: Address issue #4 - [RFE] Allow multiple columns in row pivot query
+  //
+  if( sqlite3_column_count(stmt) != 1 ){
+    *pzErr = sqlite3_mprintf("Pivot table key query expects 1 result column. Query contains %d columns.", sqlite3_column_count(stmt));
+    PIVOT_VTAB_CONNECT_ERROR
   }
   
-  char *key_column_name = sqlite3_mprintf("%s", sqlite3_column_name(stmt, 0));
+  // get key column name
+  key_column_name = sqlite3_mprintf("%s", sqlite3_column_name(stmt, 0));
   sqlite3_finalize(stmt);
-  
-  //
+
+  ///////////////////////////////////////////////////
   // Pivot query
-  //
-  char *pivot_query_sql = remove_parentheses(argv[5]);
+  ///////////////////////////////////////////////////
+
+  pivot_query_sql = remove_parentheses(argv[5]);
   //printf("%s\n", tab->pivot_query_sql);
   rc = sqlite3_prepare_v2(db, pivot_query_sql, -1, &stmt, 0);
 
   // Validate pivot query 
   if( rc!=SQLITE_OK ){
-    *pzErr = sqlite3_mprintf("Pivot query error - %s", sqlite3_errmsg(db));
-    sqlite3_free(pivot_query_sql);
-    sqlite3_free(tab);
-    return SQLITE_ERROR;
+    *pzErr = sqlite3_mprintf("Pivot query prepare error - %s", sqlite3_errmsg(db));
+    PIVOT_VTAB_CONNECT_ERROR
   }
   sqlite3_finalize(stmt);
-  
-  //
-  // declare vtab
-  //
-  sqlite3_str *create_vtab_sql = sqlite3_str_new(db);
-  
-  sqlite3_str_appendf(create_vtab_sql, "CREATE TABLE x(%Q", key_column_name);
-  sqlite3_free(key_column_name);
-  
+
+  ///////////////////////////////////////////////////
   // Pivot table column definition query
+  ///////////////////////////////////////////////////
+
   sql = remove_parentheses(argv[4]);
   rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
 
   // Validate pivot table column definition query
   if( rc!=SQLITE_OK ){
-    *pzErr = sqlite3_mprintf("Pivot table column definition query error - %s", sqlite3_errmsg(db));
-    sqlite3_free(sql);
-    sqlite3_free(tab);
-    return SQLITE_ERROR;
+    *pzErr = sqlite3_mprintf("Pivot table column definition query prepare error - %s", sqlite3_errmsg(db));
+    PIVOT_VTAB_CONNECT_ERROR
   }
-  sqlite3_free(sql);
+
+  // Validate pivot table column definition query count == 2
+  if( sqlite3_column_count(stmt) != 2 ){
+    *pzErr = sqlite3_mprintf("Pivot table column definition query expects 2 result column. Query contains %d columns.", sqlite3_column_count(stmt));
+    PIVOT_VTAB_CONNECT_ERROR
+  }
   
+  // Validate pivot columns for uniqueness
+  rc = sqlite3_get_table(db, sql, &azData, &nRow, &nCol, &zMsg);
+
+  if( rc!=SQLITE_OK ){
+    *pzErr = sqlite3_mprintf("%s", zMsg);
+    PIVOT_VTAB_CONNECT_ERROR
+  }
+
+  int i, j;
+  if( nRow > 1 ){
+    for( i=1; i<nRow-1; i++ ){
+      for( j=i+1; j<nRow; j++ ){
+        if( !strcmp(azData[i*nCol], azData[j*nCol]) ){
+          *pzErr = sqlite3_mprintf("Pivot table column keys must be unique. Duplicate column key \"%s\".", azData[i*nCol]);
+          PIVOT_VTAB_CONNECT_ERROR
+        }
+        if( !sqlite3_stricmp(azData[i*nCol+1], azData[j*nCol+1]) ){
+          *pzErr = sqlite3_mprintf("Pivot table column names must be unique. Duplicate column \"%s\".", azData[i*nCol+1]);
+          PIVOT_VTAB_CONNECT_ERROR
+        }
+      }
+      // printf("%d: %s %s\n",i*nCol,  azData[i*nCol], azData[i*nCol+1]);
+    }
+  }
+  sqlite3_free_table(azData);
+  sqlite3_free(sql);
+
+  ///////////////////////////////////////////////////
+  // Declare vtab
+  ///////////////////////////////////////////////////
+
+  sqlite3_str *create_vtab_sql = sqlite3_str_new(db);
+  
+  sqlite3_str_appendf(create_vtab_sql, "CREATE TABLE x(%Q", key_column_name);
+  sqlite3_free(key_column_name);
+
   tab->nCol_key = 0;
   while( sqlite3_step(stmt)==SQLITE_ROW ){
     tab->nCol_key++;
@@ -401,6 +462,8 @@ static int pivotDisconnect(sqlite3_vtab *pVtab){
   int i;
   for( i=0; i<tab->nCol_key; i++ )
     sqlite3_finalize(tab->col_stmt[i]);
+
+  sqlite3_free(tab->key_sql);
 
   sqlite3_free(tab);
   return SQLITE_OK;
