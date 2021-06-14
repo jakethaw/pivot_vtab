@@ -631,7 +631,6 @@ static int pivotBestIndex(
   pConstraint = pIdxInfo->aConstraint;
   for(i=0; i<pIdxInfo->nConstraint; i++, pConstraint++){
     if( pConstraint->usable==0 ) continue;
-    printf("%d %d\n", pConstraint->op, SQLITE_INDEX_CONSTRAINT_EQ);
     if( pConstraint->op!=SQLITE_INDEX_CONSTRAINT_EQ ) continue;
     if( pConstraint->iColumn < tab->nRow_key )
       pivot_key_Idx++;
