@@ -194,11 +194,14 @@ SQLITE_EXTENSION_INIT1
 */
 typedef struct pivot_vtab pivot_vtab;
 struct pivot_vtab {
-  sqlite3_vtab base;       // Base class. Must be first
-  sqlite3 *db;             // Database connection
-  int nCol_key;            // Number of column key values
-  sqlite3_stmt **col_stmt; // List of column pivot query stmts
-  char *key_sql;           // Full table scan key query
+  sqlite3_vtab base;             // Base class. Must be first
+  sqlite3 *db;                   // Database connection
+  int nRow_key;                  // Number of row key values (number of bound params-1)
+  int nRow_cols;                 // Number of row columns
+  int nCol_key;                  // Number of column key values
+  sqlite3_stmt **col_stmt;       // List of column pivot query stmts
+  char *key_sql_full_table_scan; // Full table scan key query
+  char *key_sql_filtered;        // Filtered key query
 };
 
 /* 
@@ -212,13 +215,8 @@ struct pivot_cursor {
   sqlite3_int64 iRowid;      // The rowid
   sqlite3_stmt *stmt;        // Row key prepared stmt - used for full table scan
   int rc;                    // Return value for stmt
-  sqlite3_value *pivot_key;
+  sqlite3_value **pivot_key; // Array of row keys
 };
-
-/*
-** Column numbers
-*/
-#define PIVOT_KEY_COLUMN 0
 
 /*
 ** Filter types
@@ -226,43 +224,19 @@ struct pivot_cursor {
 #define FULL_TABLE_SCAN 0
 #define FILTER_ON_KEY   1
 
-/*
-** Bind value types
-*/
-#define PIVOT_ROW_KEY 1
-#define PIVOT_COL_KEY 2
-
-/*
-** Return a string with outermost parentheses replaced with blank spaces.
-** Must be freed with sqlite3_free.
-*/
-char *remove_parentheses(const char *zIn){
-  char *sql = sqlite3_mprintf("%s", zIn);
-  int i;
-  int open_parenthesis = 0;
-  int close_parenthesis = 0;
-  for( i=0; sql[i]; i++ ){
-    if( sql[i] == '(' && !open_parenthesis ){
-      sql[i] = ' ';
-      open_parenthesis = 1;
-    }
-    if( sql[i] == ')' ){
-      close_parenthesis = i;
-    }
-  }
-  sql[close_parenthesis] = ' ';
-  return sql;
-}
-
 #define PIVOT_VTAB_CONNECT_ERROR \
-  sqlite3_finalize(stmt); \
+  sqlite3_finalize(stmt_key_query); \
+  sqlite3_finalize(stmt_pivot_query); \
+  sqlite3_finalize(stmt_col_query); \
   sqlite3_free(sql); \
   sqlite3_free(pivot_query_sql); \
-  sqlite3_free(key_column_name); \
-  sqlite3_free(tab->key_sql); \
+  sqlite3_free(tab->key_sql_full_table_scan); \
+  sqlite3_free(tab->key_sql_filtered); \
   sqlite3_free(tab); \
   sqlite3_free(zMsg); \
   sqlite3_free_table(azData); \
+  sqlite3_free(sqlite3_str_finish(create_vtab_sql)); \
+  sqlite3_free(sqlite3_str_finish(key_sql_filtered)); \
   return SQLITE_ERROR;
 
 /*
@@ -288,9 +262,14 @@ static int pivotConnect(
   pivot_vtab *tab;
   char *sql = 0;
   char *pivot_query_sql = 0;
-  char *key_column_name = 0;
-  sqlite3_stmt *stmt;
+  sqlite3_stmt *stmt_key_query = 0;
+  sqlite3_stmt *stmt_pivot_query = 0;
+  sqlite3_stmt *stmt_col_query = 0;
   int rc;
+  int i, j;
+
+  sqlite3_str *create_vtab_sql = 0;
+  sqlite3_str *key_sql_filtered = 0;
   
   tab = (pivot_vtab*)sqlite3_malloc(sizeof(pivot_vtab));
   if( tab==0 ) return SQLITE_NOMEM;
@@ -304,12 +283,16 @@ static int pivotConnect(
   char **azData = 0;
   char *zMsg = 0;
 
+  // CREATE TABLE string
+  create_vtab_sql = sqlite3_str_new(db);
+  sqlite3_str_appendall(create_vtab_sql, "CREATE TABLE x(");
+
   ///////////////////////////////////////////////////
   // Pivot table key query
   ///////////////////////////////////////////////////
 
-  tab->key_sql = remove_parentheses(argv[3]);
-  rc = sqlite3_prepare_v2(db, tab->key_sql, -1, &stmt, 0);
+  tab->key_sql_full_table_scan =  sqlite3_mprintf("SELECT * FROM \n%s", argv[3]);
+  rc = sqlite3_prepare_v2(db, tab->key_sql_full_table_scan, -1, &stmt_key_query, 0);
 
   // Validate pivot table key query
   if( rc!=SQLITE_OK ){
@@ -317,40 +300,61 @@ static int pivotConnect(
     PIVOT_VTAB_CONNECT_ERROR
   }
 
-  // Validate pivot table key query column count == 1
-  //
-  // TODO: Address issue #4 - [RFE] Allow multiple columns in row pivot query
-  //
-  if( sqlite3_column_count(stmt) != 1 ){
-    *pzErr = sqlite3_mprintf("Pivot table key query expects 1 result column. Query contains %d columns.", sqlite3_column_count(stmt));
-    PIVOT_VTAB_CONNECT_ERROR
-  }
-  
-  // get key column name
-  key_column_name = sqlite3_mprintf("%s", sqlite3_column_name(stmt, 0));
-  sqlite3_finalize(stmt);
+  // get row key columnn count
+  tab->nRow_cols = sqlite3_column_count(stmt_key_query);
+
+  // get row key column names
+  sqlite3_str_appendf(create_vtab_sql, "\"%w\"", sqlite3_column_name(stmt_key_query, 0));
+  for( i=1; i<tab->nRow_cols; i++ )
+    sqlite3_str_appendf(create_vtab_sql, ",\"%w\"", sqlite3_column_name(stmt_key_query, i));
 
   ///////////////////////////////////////////////////
   // Pivot query
   ///////////////////////////////////////////////////
 
-  pivot_query_sql = remove_parentheses(argv[5]);
-  //printf("%s\n", tab->pivot_query_sql);
-  rc = sqlite3_prepare_v2(db, pivot_query_sql, -1, &stmt, 0);
+  pivot_query_sql =  sqlite3_mprintf("SELECT * FROM \n%s", argv[5]);
+  rc = sqlite3_prepare_v2(db, pivot_query_sql, -1, &stmt_pivot_query, 0);
 
   // Validate pivot query 
   if( rc!=SQLITE_OK ){
     *pzErr = sqlite3_mprintf("Pivot query prepare error - %s", sqlite3_errmsg(db));
     PIVOT_VTAB_CONNECT_ERROR
   }
-  sqlite3_finalize(stmt);
+
+  tab->nRow_key = sqlite3_bind_parameter_count(stmt_pivot_query)-1;
+
+  // Validate bound param count
+  if( tab->nRow_key > tab->nRow_cols ){
+    *pzErr = sqlite3_mprintf("Pivot table key query error - Unexpected number of bound parameters.");
+    PIVOT_VTAB_CONNECT_ERROR
+  }
+
+  sqlite3_finalize(stmt_pivot_query);
+  stmt_pivot_query = 0;
+
+  ///////////////////////////////////////////////////
+  // Filtered key query
+  ///////////////////////////////////////////////////
+
+  // Create filtered key query
+  key_sql_filtered = sqlite3_str_new(db);
+  sqlite3_str_appendall(key_sql_filtered, tab->key_sql_full_table_scan);
+  sqlite3_str_appendf(key_sql_filtered, "\n WHERE \"%w\" = ?", sqlite3_column_name(stmt_key_query, 0));
+  for( i=1; i<tab->nRow_key; i++ )
+    sqlite3_str_appendf(key_sql_filtered, " AND \"%w\" = ?", sqlite3_column_name(stmt_key_query, i));
+
+  tab->key_sql_filtered = sqlite3_str_finish(key_sql_filtered);
+  key_sql_filtered = 0;
+
+  sqlite3_finalize(stmt_key_query);
+  stmt_key_query = 0;
 
   ///////////////////////////////////////////////////
   // Pivot table column definition query
   ///////////////////////////////////////////////////
 
-  sql = remove_parentheses(argv[4]);
-  rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+  sql =  sqlite3_mprintf("SELECT * FROM \n%s", argv[4]);
+  rc = sqlite3_prepare_v2(db, sql, -1, &stmt_col_query, 0);
 
   // Validate pivot table column definition query
   if( rc!=SQLITE_OK ){
@@ -359,8 +363,8 @@ static int pivotConnect(
   }
 
   // Validate pivot table column definition query count == 2
-  if( sqlite3_column_count(stmt) != 2 ){
-    *pzErr = sqlite3_mprintf("Pivot table column definition query expects 2 result column. Query contains %d columns.", sqlite3_column_count(stmt));
+  if( sqlite3_column_count(stmt_col_query) != 2 ){
+    *pzErr = sqlite3_mprintf("Pivot table column definition query expects 2 result column. Query contains %d columns.", sqlite3_column_count(stmt_col_query));
     PIVOT_VTAB_CONNECT_ERROR
   }
   
@@ -372,7 +376,6 @@ static int pivotConnect(
     PIVOT_VTAB_CONNECT_ERROR
   }
 
-  int i, j;
   if( nRow > 1 ){
     for( i=1; i<nRow-1; i++ ){
       for( j=i+1; j<nRow; j++ ){
@@ -385,44 +388,31 @@ static int pivotConnect(
           PIVOT_VTAB_CONNECT_ERROR
         }
       }
-      // printf("%d: %s %s\n",i*nCol,  azData[i*nCol], azData[i*nCol+1]);
     }
   }
   sqlite3_free_table(azData);
   sqlite3_free(sql);
 
   ///////////////////////////////////////////////////
-  // Declare vtab
+  // Construct remainder of vtab definition
   ///////////////////////////////////////////////////
 
-  sqlite3_str *create_vtab_sql = sqlite3_str_new(db);
-  
-  sqlite3_str_appendf(create_vtab_sql, "CREATE TABLE x(%Q", key_column_name);
-  sqlite3_free(key_column_name);
-
   tab->nCol_key = 0;
-  while( sqlite3_step(stmt)==SQLITE_ROW ){
+  while( sqlite3_step(stmt_col_query)==SQLITE_ROW ){
     tab->nCol_key++;
     tab->col_stmt = sqlite3_realloc(tab->col_stmt, tab->nCol_key*sizeof(sqlite3_stmt*));
     
     // prepare pivot col stmt
     sqlite3_prepare_v2(db, pivot_query_sql, -1, &(tab->col_stmt[tab->nCol_key-1]), 0);
-    sqlite3_bind_value(tab->col_stmt[tab->nCol_key-1],
-                       PIVOT_COL_KEY,
-                       sqlite3_column_value(stmt, 0)
-                      );
-    
-    sqlite3_str_appendf(create_vtab_sql,
-                        ",%Q",
-                        sqlite3_column_text(stmt, 1)
-                       );
+    sqlite3_bind_value(tab->col_stmt[tab->nCol_key-1], tab->nRow_key+1, sqlite3_column_value(stmt_col_query, 0));
+    sqlite3_str_appendf(create_vtab_sql, ",\"%w\"", sqlite3_column_text(stmt_col_query, 1));
   }
-  sqlite3_finalize(stmt);
+  sqlite3_finalize(stmt_col_query);
   sqlite3_free(pivot_query_sql);
   sqlite3_str_appendall(create_vtab_sql, ")");
   
   sql = sqlite3_str_finish(create_vtab_sql);
-  //printf("%s\n", sql);
+  // printf("%s\n", sql);
   rc = sqlite3_declare_vtab(db, sql);
   sqlite3_free(sql);
   
@@ -463,7 +453,8 @@ static int pivotDisconnect(sqlite3_vtab *pVtab){
   for( i=0; i<tab->nCol_key; i++ )
     sqlite3_finalize(tab->col_stmt[i]);
 
-  sqlite3_free(tab->key_sql);
+  sqlite3_free(tab->key_sql_full_table_scan);
+  sqlite3_free(tab->key_sql_filtered);
 
   sqlite3_free(tab);
   return SQLITE_OK;
@@ -486,13 +477,6 @@ static int pivotOpen(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCur){
 */
 static int pivotClose(sqlite3_vtab_cursor *pCur){
   pivot_cursor *cur = (pivot_cursor*)pCur; 
-  
-  if( cur->stmt ) 
-    sqlite3_finalize(cur->stmt);
-  
-  if( cur->pivot_key )
-    sqlite3_value_free(cur->pivot_key);
-  
   sqlite3_free(cur);
   return SQLITE_OK;
 }
@@ -501,21 +485,21 @@ static int pivotClose(sqlite3_vtab_cursor *pCur){
 ** Advance a pivot_cursor to its next row of output.
 */
 static int pivotNext(sqlite3_vtab_cursor *pCur){
+  pivot_vtab *tab = (pivot_vtab*)pCur->pVtab;
   pivot_cursor *cur = (pivot_cursor*)pCur;
+  int i;
   
   if( cur->pivot_key ){
-    sqlite3_value_free(cur->pivot_key);
-    cur->pivot_key = 0;
+    for( i=0; i<tab->nRow_cols; i++ ){
+      sqlite3_value_free(cur->pivot_key[i]);
+      cur->pivot_key[i] = 0;
+    }
   }
   
-  // Full table scan
-  if( cur->stmt ){
-    cur->rc = sqlite3_step(cur->stmt);
-    if( cur->rc == SQLITE_DONE ){
-      cur->pivot_key = 0;
-    }else{
-      cur->pivot_key = sqlite3_value_dup(sqlite3_column_value(cur->stmt, 0));
-    }
+  cur->rc = sqlite3_step(cur->stmt);
+  if( cur->rc != SQLITE_DONE ){
+    for( i=0; i<tab->nRow_cols; i++ )
+      cur->pivot_key[i] = sqlite3_value_dup(sqlite3_column_value(cur->stmt, i));
   }
   
   cur->iRowid++;
@@ -533,14 +517,17 @@ static int pivotColumn(
 ){
   pivot_vtab *tab = (pivot_vtab*)pCur->pVtab;
   pivot_cursor *cur = (pivot_cursor*)pCur;
-  
-  if( i==PIVOT_KEY_COLUMN ){
+
+  if( i<tab->nRow_cols ){
     // return the row key
-    sqlite3_result_value(ctx, cur->pivot_key);
+    sqlite3_result_value(ctx, cur->pivot_key[i]);
   }else{
     // return column value, or null
-    sqlite3_stmt *stmt = tab->col_stmt[i-1];
-    sqlite3_bind_value(stmt, PIVOT_ROW_KEY, cur->pivot_key);
+    sqlite3_stmt *stmt = tab->col_stmt[i-tab->nRow_cols];
+
+    for( i=0; i<tab->nRow_key; i++ )
+      sqlite3_bind_value(stmt, i+1, cur->pivot_key[i]);
+
     if( sqlite3_step(stmt)==SQLITE_ROW ){
       sqlite3_result_value(ctx, sqlite3_column_value(stmt, 0));
     }else{
@@ -566,14 +553,20 @@ static int pivotRowid(sqlite3_vtab_cursor *pCur, sqlite_int64 *pRowid){
 ** row of output.
 */
 static int pivotEof(sqlite3_vtab_cursor *pCur){
-  pivot_cursor *cur = (pivot_cursor*)pCur;
-  
-  // Full table scan 
-  if( cur->stmt )
-    return cur->rc == SQLITE_DONE;
-  
-  // Filtered on pivot table row key
-  return cur->iRowid > 1;
+  pivot_vtab *tab = (pivot_vtab*)pCur->pVtab;
+  pivot_cursor *cur = (pivot_cursor*)pCur; 
+  int i;
+
+  if( cur->rc == SQLITE_DONE ){
+    if( cur->pivot_key ){
+      for( i=0; i<tab->nRow_cols; i++ )
+        sqlite3_value_free(cur->pivot_key[i]);
+      sqlite3_free(cur->pivot_key);
+    }
+    sqlite3_finalize(cur->stmt);
+    return 1;
+  }
+  return 0;
 }
 
 /*
@@ -589,21 +582,31 @@ static int pivotFilter(
 ){
   pivot_vtab *tab = (pivot_vtab*)pVtabCursor->pVtab;
   pivot_cursor *cur = (pivot_cursor*)pVtabCursor;
+  int i;
+  
+  cur->pivot_key = sqlite3_malloc(tab->nRow_cols*sizeof(sqlite3_value*));
   
   switch( idxNum ){
     case FULL_TABLE_SCAN:
-      sqlite3_prepare_v2(tab->db, tab->key_sql, -1, &(cur->stmt), 0);
-      cur->rc = sqlite3_step(cur->stmt);
-      if( cur->rc == SQLITE_DONE ){
-        cur->pivot_key = 0;
-      }else{
-        cur->pivot_key = sqlite3_value_dup(sqlite3_column_value(cur->stmt, 0));
-      }
+      sqlite3_prepare_v2(tab->db, tab->key_sql_full_table_scan, -1, &(cur->stmt), 0);
       break;
+
     case FILTER_ON_KEY:
-      cur->stmt = 0;
-      cur->pivot_key = sqlite3_value_dup(argv[0]);
+      sqlite3_prepare_v2(tab->db, tab->key_sql_filtered, -1, &(cur->stmt), 0);
+      for( i=0; i<argc; i++ )
+        sqlite3_bind_value(cur->stmt, i+1, argv[i]);
+
+      // printf("%s\n", sqlite3_expanded_sql(cur->stmt));
+
       break;
+  }
+
+  cur->rc = sqlite3_step(cur->stmt);
+  if( cur->rc == SQLITE_DONE ){
+    cur->pivot_key = 0;
+  }else{
+    for( i=0; i<tab->nRow_cols; i++ )
+      cur->pivot_key[i] = sqlite3_value_dup(sqlite3_column_value(cur->stmt, i));
   }
   
   cur->iRowid = 1;
@@ -617,26 +620,27 @@ static int pivotFilter(
 ** plan.
 */
 static int pivotBestIndex(
-  sqlite3_vtab *tab,
+  sqlite3_vtab *pVtab,
   sqlite3_index_info *pIdxInfo
 ){
+  pivot_vtab *tab = (pivot_vtab*)pVtab;
   int i;
-  int pivot_key_Idx = -1;
+  int pivot_key_Idx = 0;
 
   const struct sqlite3_index_constraint *pConstraint;
   pConstraint = pIdxInfo->aConstraint;
   for(i=0; i<pIdxInfo->nConstraint; i++, pConstraint++){
     if( pConstraint->usable==0 ) continue;
+    printf("%d %d\n", pConstraint->op, SQLITE_INDEX_CONSTRAINT_EQ);
     if( pConstraint->op!=SQLITE_INDEX_CONSTRAINT_EQ ) continue;
-    switch( pConstraint->iColumn ){
-      case PIVOT_KEY_COLUMN:
-        pivot_key_Idx = i;
-        break;
-    }
+    if( pConstraint->iColumn < tab->nRow_key )
+      pivot_key_Idx++;
   }
-  if( pivot_key_Idx>=0 ){
-    pIdxInfo->aConstraintUsage[pivot_key_Idx].argvIndex = 1;
-    pIdxInfo->aConstraintUsage[pivot_key_Idx].omit = 1;
+  if( pivot_key_Idx==tab->nRow_key ){
+    for( i=0; i<tab->nRow_key; i++ ){
+      pIdxInfo->aConstraintUsage[i].argvIndex = i+1;
+      pIdxInfo->aConstraintUsage[i].omit = 1;
+    }
     pIdxInfo->estimatedCost = (double)1;
     pIdxInfo->estimatedRows = 1;
     pIdxInfo->idxFlags = SQLITE_INDEX_SCAN_UNIQUE;
