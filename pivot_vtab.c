@@ -201,7 +201,7 @@ struct pivot_vtab {
   int nCol_key;                  // Number of column key values
   sqlite3_stmt **col_stmt;       // List of column pivot query stmts
   char *key_sql_full_table_scan; // Full table scan key query
-  char *key_sql_filtered;        // Filtered key query
+  char **key_sql_col_names;      // Array of key query column names
 };
 
 /* 
@@ -218,12 +218,6 @@ struct pivot_cursor {
   sqlite3_value **pivot_key; // Array of row keys
 };
 
-/*
-** Filter types
-*/
-#define FULL_TABLE_SCAN 0
-#define FILTER_ON_KEY   1
-
 #define PIVOT_VTAB_CONNECT_ERROR \
   sqlite3_finalize(stmt_key_query); \
   sqlite3_finalize(stmt_pivot_query); \
@@ -231,12 +225,16 @@ struct pivot_cursor {
   sqlite3_free(sql); \
   sqlite3_free(pivot_query_sql); \
   sqlite3_free(tab->key_sql_full_table_scan); \
-  sqlite3_free(tab->key_sql_filtered); \
-  sqlite3_free(tab); \
   sqlite3_free(zMsg); \
   sqlite3_free_table(azData); \
   sqlite3_free(sqlite3_str_finish(create_vtab_sql)); \
-  sqlite3_free(sqlite3_str_finish(key_sql_filtered)); \
+  for( i=0; i<tab->nCol_key; i++ ) \
+    sqlite3_finalize(tab->col_stmt[i]); \
+  sqlite3_free(tab->col_stmt); \
+  for( i=0; i<tab->nRow_cols; i++ ) \
+    sqlite3_free(tab->key_sql_col_names[i]); \
+  sqlite3_free(tab->key_sql_col_names); \
+  sqlite3_free(tab); \
   return SQLITE_ERROR;
 
 /*
@@ -269,7 +267,6 @@ static int pivotConnect(
   int i, j;
 
   sqlite3_str *create_vtab_sql = 0;
-  sqlite3_str *key_sql_filtered = 0;
   
   tab = (pivot_vtab*)sqlite3_malloc(sizeof(pivot_vtab));
   if( tab==0 ) return SQLITE_NOMEM;
@@ -304,9 +301,18 @@ static int pivotConnect(
   tab->nRow_cols = sqlite3_column_count(stmt_key_query);
 
   // get row key column names
-  sqlite3_str_appendf(create_vtab_sql, "\"%w\"", sqlite3_column_name(stmt_key_query, 0));
-  for( i=1; i<tab->nRow_cols; i++ )
-    sqlite3_str_appendf(create_vtab_sql, ",\"%w\"", sqlite3_column_name(stmt_key_query, i));
+  tab->key_sql_col_names = sqlite3_malloc(tab->nRow_cols*sizeof(char*));
+  memset(tab->key_sql_col_names, 0, tab->nRow_cols*sizeof(char*));
+
+  for( i=0; i<tab->nRow_cols; i++ ){
+    tab->key_sql_col_names[i] = sqlite3_mprintf("\"%w\"", sqlite3_column_name(stmt_key_query, i));
+    if( i>0 )
+      sqlite3_str_appendall(create_vtab_sql, ",");
+    sqlite3_str_appendf(create_vtab_sql, "%s", tab->key_sql_col_names[i]);
+  }
+
+  sqlite3_finalize(stmt_key_query);
+  stmt_key_query = 0;
 
   ///////////////////////////////////////////////////
   // Pivot query
@@ -331,23 +337,6 @@ static int pivotConnect(
 
   sqlite3_finalize(stmt_pivot_query);
   stmt_pivot_query = 0;
-
-  ///////////////////////////////////////////////////
-  // Filtered key query
-  ///////////////////////////////////////////////////
-
-  // Create filtered key query
-  key_sql_filtered = sqlite3_str_new(db);
-  sqlite3_str_appendall(key_sql_filtered, tab->key_sql_full_table_scan);
-  sqlite3_str_appendf(key_sql_filtered, "\n WHERE \"%w\" = ?", sqlite3_column_name(stmt_key_query, 0));
-  for( i=1; i<tab->nRow_key; i++ )
-    sqlite3_str_appendf(key_sql_filtered, " AND \"%w\" = ?", sqlite3_column_name(stmt_key_query, i));
-
-  tab->key_sql_filtered = sqlite3_str_finish(key_sql_filtered);
-  key_sql_filtered = 0;
-
-  sqlite3_finalize(stmt_key_query);
-  stmt_key_query = 0;
 
   ///////////////////////////////////////////////////
   // Pivot table column definition query
@@ -444,7 +433,7 @@ static int pivotRename(
 }
 
 /*
-** This method is the destructor for pivot_cursor objects.
+** This method is the destructor for pivot_vtab objects.
 */
 static int pivotDisconnect(sqlite3_vtab *pVtab){
   pivot_vtab *tab = (pivot_vtab*)pVtab;
@@ -452,9 +441,13 @@ static int pivotDisconnect(sqlite3_vtab *pVtab){
   int i;
   for( i=0; i<tab->nCol_key; i++ )
     sqlite3_finalize(tab->col_stmt[i]);
+  sqlite3_free(tab->col_stmt);
+
+  for( i=0; i<tab->nRow_cols; i++ )
+    sqlite3_free(tab->key_sql_col_names[i]);
+  sqlite3_free(tab->key_sql_col_names);
 
   sqlite3_free(tab->key_sql_full_table_scan);
-  sqlite3_free(tab->key_sql_filtered);
 
   sqlite3_free(tab);
   return SQLITE_OK;
@@ -586,20 +579,12 @@ static int pivotFilter(
   
   cur->pivot_key = sqlite3_malloc(tab->nRow_cols*sizeof(sqlite3_value*));
   
-  switch( idxNum ){
-    case FULL_TABLE_SCAN:
-      sqlite3_prepare_v2(tab->db, tab->key_sql_full_table_scan, -1, &(cur->stmt), 0);
-      break;
+  // Row query
+  sqlite3_prepare_v2(tab->db, idxStr, -1, &(cur->stmt), 0);
+  for( i=0; i<argc; i++ )
+    sqlite3_bind_value(cur->stmt, i+1, argv[i]);
 
-    case FILTER_ON_KEY:
-      sqlite3_prepare_v2(tab->db, tab->key_sql_filtered, -1, &(cur->stmt), 0);
-      for( i=0; i<argc; i++ )
-        sqlite3_bind_value(cur->stmt, i+1, argv[i]);
-
-      // printf("%s\n", sqlite3_expanded_sql(cur->stmt));
-
-      break;
-  }
+  // printf("%s\n", sqlite3_expanded_sql(cur->stmt));
 
   cur->rc = sqlite3_step(cur->stmt);
   if( cur->rc == SQLITE_DONE ){
@@ -625,30 +610,58 @@ static int pivotBestIndex(
 ){
   pivot_vtab *tab = (pivot_vtab*)pVtab;
   int i;
-  int pivot_key_Idx = 0;
+  int argvIndex = 1;
+  char *op;
+
+  sqlite3_str *key_sql_filtered;
+
+  key_sql_filtered = sqlite3_str_new(tab->db);
+  sqlite3_str_appendall(key_sql_filtered, tab->key_sql_full_table_scan);
 
   const struct sqlite3_index_constraint *pConstraint;
   pConstraint = pIdxInfo->aConstraint;
   for(i=0; i<pIdxInfo->nConstraint; i++, pConstraint++){
     if( pConstraint->usable==0 ) continue;
-    if( pConstraint->op!=SQLITE_INDEX_CONSTRAINT_EQ ) continue;
-    if( pConstraint->iColumn < tab->nRow_key )
-      pivot_key_Idx++;
-  }
-  if( pivot_key_Idx==tab->nRow_key ){
-    for( i=0; i<tab->nRow_key; i++ ){
-      pIdxInfo->aConstraintUsage[i].argvIndex = i+1;
+    switch( pConstraint->op ){
+      case SQLITE_INDEX_CONSTRAINT_EQ:
+        op = "=";
+        break;
+      case SQLITE_INDEX_CONSTRAINT_NE:
+        op = "<>";
+        break;
+      case SQLITE_INDEX_CONSTRAINT_LT:
+        op = "<";
+        break;
+      case SQLITE_INDEX_CONSTRAINT_LE:
+        op = "<=";
+        break;
+      case SQLITE_INDEX_CONSTRAINT_GT:
+        op = ">";
+        break;
+      case SQLITE_INDEX_CONSTRAINT_GE:
+        op = ">=";
+        break;
+      default:
+        pIdxInfo->aConstraintUsage[i].omit = 0;
+        op = 0;
+        break;
+    }
+
+    if( op ){
+      if( argvIndex==1 ){
+        sqlite3_str_appendall(key_sql_filtered, "\n WHERE ");
+      } else{
+        sqlite3_str_appendall(key_sql_filtered, " AND ");
+      }
+      sqlite3_str_appendf(key_sql_filtered, "%s %s ?", tab->key_sql_col_names[pConstraint->iColumn], op);
+      pIdxInfo->aConstraintUsage[i].argvIndex = argvIndex++;
       pIdxInfo->aConstraintUsage[i].omit = 1;
     }
-    pIdxInfo->estimatedCost = (double)1;
-    pIdxInfo->estimatedRows = 1;
-    pIdxInfo->idxFlags = SQLITE_INDEX_SCAN_UNIQUE;
-    pIdxInfo->idxNum = FILTER_ON_KEY;
-  }else{
-    pIdxInfo->estimatedCost = (double)2147483647;
-    pIdxInfo->estimatedRows = 2147483647;
-    pIdxInfo->idxNum = FULL_TABLE_SCAN;
   }
+  pIdxInfo->idxNum = 0;
+  pIdxInfo->estimatedCost = (double)2147483647/argvIndex;
+  pIdxInfo->estimatedRows = 10;
+  pIdxInfo->idxStr = sqlite3_str_finish(key_sql_filtered);
   
   return SQLITE_OK;
 }
