@@ -196,7 +196,7 @@ typedef struct pivot_vtab pivot_vtab;
 struct pivot_vtab {
   sqlite3_vtab base;             // Base class. Must be first
   sqlite3 *db;                   // Database connection
-  int nRow_key;                  // Number of row key values (number of bound params-1)
+  int nRow_key;                  // Number of row key values (number of pivot query bound params minus 1)
   int nRow_cols;                 // Number of row columns
   int nCol_key;                  // Number of column key values
   sqlite3_stmt **col_stmt;       // List of column pivot query stmts
@@ -611,6 +611,7 @@ static int pivotBestIndex(
   pivot_vtab *tab = (pivot_vtab*)pVtab;
   int i;
   int argvIndex = 1;
+  int orderIdx = 0;
   char *op;
 
   sqlite3_str *key_sql_filtered;
@@ -622,12 +623,10 @@ static int pivotBestIndex(
   pConstraint = pIdxInfo->aConstraint;
   for(i=0; i<pIdxInfo->nConstraint; i++, pConstraint++){
     if( pConstraint->usable==0 ) continue;
+    if( !(pConstraint->iColumn < tab->nRow_cols) ) continue;
     switch( pConstraint->op ){
       case SQLITE_INDEX_CONSTRAINT_EQ:
         op = "=";
-        break;
-      case SQLITE_INDEX_CONSTRAINT_NE:
-        op = "<>";
         break;
       case SQLITE_INDEX_CONSTRAINT_LT:
         op = "<";
@@ -641,6 +640,30 @@ static int pivotBestIndex(
       case SQLITE_INDEX_CONSTRAINT_GE:
         op = ">=";
         break;
+      case SQLITE_INDEX_CONSTRAINT_MATCH:
+        op = "MATCH";
+        break;
+      case SQLITE_INDEX_CONSTRAINT_LIKE:
+        op = "LIKE";
+        break;
+      case SQLITE_INDEX_CONSTRAINT_GLOB:
+        op = "GLOB";
+        break;
+      case SQLITE_INDEX_CONSTRAINT_REGEXP:
+        op = "REGEXP";
+        break;
+      case SQLITE_INDEX_CONSTRAINT_NE:
+        op = "<>";
+        break;
+      case SQLITE_INDEX_CONSTRAINT_ISNOT:
+      case SQLITE_INDEX_CONSTRAINT_ISNOTNULL:
+        op = "IS NOT";
+        break;
+      case SQLITE_INDEX_CONSTRAINT_ISNULL:
+      case SQLITE_INDEX_CONSTRAINT_IS:
+        op = "IS";
+        break;
+      case SQLITE_INDEX_CONSTRAINT_FUNCTION:
       default:
         pIdxInfo->aConstraintUsage[i].omit = 0;
         op = 0;
@@ -658,10 +681,26 @@ static int pivotBestIndex(
       pIdxInfo->aConstraintUsage[i].omit = 1;
     }
   }
+
+  const struct sqlite3_index_orderby *pOrderBy;
+  pOrderBy = pIdxInfo->aOrderBy;
+  for(i=0; i<pIdxInfo->nOrderBy; i++, pOrderBy++){
+    if( !(pOrderBy->iColumn < tab->nRow_cols) ) continue;
+    if( orderIdx==0 ){
+      sqlite3_str_appendall(key_sql_filtered, "\n ORDER BY ");
+    } else{
+      sqlite3_str_appendall(key_sql_filtered, ", ");
+    }
+    sqlite3_str_appendf(key_sql_filtered, "%s %s", tab->key_sql_col_names[pOrderBy->iColumn], pOrderBy->desc ? "DESC" : "");
+    pIdxInfo->orderByConsumed = 1;
+    orderIdx++;
+  }
+
   pIdxInfo->idxNum = 0;
   pIdxInfo->estimatedCost = (double)2147483647/argvIndex;
   pIdxInfo->estimatedRows = 10;
   pIdxInfo->idxStr = sqlite3_str_finish(key_sql_filtered);
+  pIdxInfo->needToFreeIdxStr = 1;
   
   return SQLITE_OK;
 }
