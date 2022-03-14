@@ -469,7 +469,17 @@ static int pivotOpen(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCur){
 ** Destructor for a pivot_cursor.
 */
 static int pivotClose(sqlite3_vtab_cursor *pCur){
-  pivot_cursor *cur = (pivot_cursor*)pCur; 
+  pivot_vtab *tab = (pivot_vtab*)pCur->pVtab;
+  pivot_cursor *cur = (pivot_cursor*)pCur;
+  int i;
+
+  if( cur->pivot_key ){
+    for( i=0; i<tab->nRow_cols; i++ )
+      sqlite3_value_free(cur->pivot_key[i]);
+    sqlite3_free(cur->pivot_key);
+  }
+  if( cur->stmt )
+    sqlite3_finalize(cur->stmt);
   sqlite3_free(cur);
   return SQLITE_OK;
 }
@@ -557,6 +567,7 @@ static int pivotEof(sqlite3_vtab_cursor *pCur){
       sqlite3_free(cur->pivot_key);
     }
     sqlite3_finalize(cur->stmt);
+    cur->stmt = 0;
     return 1;
   }
   return 0;
